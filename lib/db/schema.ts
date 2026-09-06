@@ -4,6 +4,7 @@ import {
   index,
   integer,
   jsonb,
+  pgEnum,
   pgTable,
   text,
   timestamp,
@@ -11,14 +12,32 @@ import {
 } from "drizzle-orm/pg-core";
 import type { ClientSessionState, MessageStreamEvent } from "eve/client";
 
+// ============================================================================
+// Enums
+// ============================================================================
+
+export const userRoleEnum = pgEnum("user_role", ["user", "admin", "moderator"]);
+export const userStatusEnum = pgEnum("user_status", ["active", "inactive", "banned"]);
+export const mediaTypeEnum = pgEnum("media_type", ["image", "video", "document"]);
+export const eventStatusEnum = pgEnum("event_status", ["success", "failure"]);
+
+// ============================================================================
+// Core Auth Tables (Better Auth)
+// ============================================================================
+
 export const user = pgTable("user", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   email: text("email").notNull().unique(),
   emailVerified: boolean("email_verified").notNull().default(false),
   image: text("image"),
+  bio: text("bio"),
+  role: userRoleEnum("role").notNull().default("user"),
+  status: userStatusEnum("status").notNull().default("active"),
+  passwordHash: text("password_hash"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  deletedAt: timestamp("deleted_at"),
 });
 
 export const session = pgTable("session", {
@@ -61,6 +80,10 @@ export const verification = pgTable("verification", {
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
+// ============================================================================
+// Chat & Messages
+// ============================================================================
+
 export const chat = pgTable(
   "chat",
   {
@@ -98,6 +121,104 @@ export const chatEvent = pgTable(
   ],
 );
 
+// ============================================================================
+// Media Files
+// ============================================================================
+
+export const mediaFile = pgTable(
+  "media_file",
+  {
+    id: text("id").primaryKey(),
+    chatId: text("chat_id")
+      .notNull()
+      .references(() => chat.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    fileType: mediaTypeEnum("file_type").notNull(),
+    mimeType: text("mime_type").notNull(),
+    fileSize: integer("file_size").notNull(),
+    fileUrl: text("file_url").notNull(),
+    thumbnailUrl: text("thumbnail_url"),
+    metadata: jsonb("metadata").$type<{
+      width?: number;
+      height?: number;
+      duration?: number;
+      [key: string]: unknown;
+    }>(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    deletedAt: timestamp("deleted_at"),
+  },
+  (table) => [
+    index("idx_media_chat").on(table.chatId),
+    index("idx_media_user").on(table.userId),
+    index("idx_media_created").on(table.createdAt),
+  ],
+);
+
+// ============================================================================
+// Activity Logs
+// ============================================================================
+
+export const activityLog = pgTable(
+  "activity_log",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    eventType: text("event_type").notNull(),
+    eventName: text("event_name").notNull(),
+    details: jsonb("details").$type<Record<string, unknown>>(),
+    ipAddress: text("ip_address"),
+    userAgent: text("user_agent"),
+    status: eventStatusEnum("status").notNull().default("success"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (table) => [
+    index("idx_activity_user").on(table.userId),
+    index("idx_activity_type").on(table.eventType),
+    index("idx_activity_created").on(table.createdAt),
+  ],
+);
+
+// ============================================================================
+// Audit Logs (Admin Actions)
+// ============================================================================
+
+export const auditLog = pgTable(
+  "audit_log",
+  {
+    id: text("id").primaryKey(),
+    adminId: text("admin_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    action: text("action").notNull(),
+    targetId: text("target_id"),
+    targetType: text("target_type"),
+    changes: jsonb("changes").$type<Record<string, { before?: unknown; after?: unknown }>>(),
+    reason: text("reason"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (table) => [
+    index("idx_audit_admin").on(table.adminId),
+    index("idx_audit_target").on(table.targetId),
+    index("idx_audit_created").on(table.createdAt),
+  ],
+);
+
+// ============================================================================
+// Type Exports
+// ============================================================================
+
+export type User = typeof user.$inferSelect;
 export type Chat = typeof chat.$inferSelect;
 export type ChatEvent = typeof chatEvent.$inferSelect;
-export type User = typeof user.$inferSelect;
+export type MediaFile = typeof mediaFile.$inferSelect;
+export type ActivityLog = typeof activityLog.$inferSelect;
+export type AuditLog = typeof auditLog.$inferSelect;
+
+export type UserInsert = typeof user.$inferInsert;
+export type MediaFileInsert = typeof mediaFile.$inferInsert;
+export type ActivityLogInsert = typeof activityLog.$inferInsert;
+export type AuditLogInsert = typeof auditLog.$inferInsert;
