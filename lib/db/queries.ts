@@ -1,409 +1,236 @@
+import { eq, desc, and, gte, lte, asc } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, gte, lt, or, sql } from "drizzle-orm";
-import type { ClientSessionState, MessageStreamEvent } from "eve/client";
-import { isChatTurnSettledEvent } from "@/lib/chat/events";
-import type { ActiveChat, ChatListItem, ChatListPage } from "@/lib/chat/types";
-import { createFallbackTitle, DEFAULT_CHAT_TITLE } from "@/lib/chat/title";
-import { chat, chatEvent } from "@/lib/db/schema";
-import { db } from "@/lib/db/client";
+import { db } from "./client";
+import {
+  user,
+  chat,
+  mediaFile,
+  activityLog,
+  auditLog,
+  chatEvent,
+} from "./schema";
+import type {
+  User,
+  UserInsert,
+  MediaFile,
+  MediaFileInsert,
+  ActivityLog,
+  ActivityLogInsert,
+  AuditLog,
+  AuditLogInsert,
+} from "./schema";
 
-const CHAT_HISTORY_PAGE_SIZE = 20;
+// ============================================================================
+// User Queries
+// ============================================================================
 
-function encodeChatCursor(updatedAt: Date, id: string) {
-  return `${updatedAt.toISOString()}::${id}`;
+export async function getUserById(userId: string): Promise<User | undefined> {
+  return db.query.user.findFirst({
+    where: (users, { eq }) => eq(users.id, userId),
+  });
 }
 
-function decodeChatCursor(cursor: string) {
-  const [updatedAtRaw, id] = cursor.split("::");
-
-  if (!updatedAtRaw || !id) {
-    return null;
-  }
-
-  const updatedAt = new Date(updatedAtRaw);
-
-  if (Number.isNaN(updatedAt.getTime())) {
-    return null;
-  }
-
-  return { id, updatedAt };
+export async function getUserByEmail(email: string): Promise<User | undefined> {
+  return db.query.user.findFirst({
+    where: (users, { eq }) => eq(users.email, email),
+  });
 }
 
-export async function listChatsByUser(userId: string): Promise<ChatListItem[]> {
-  const page = await listChatsPageByUser(userId);
-
-  return [...page.items];
+export async function listUsers(limit = 50, offset = 0): Promise<User[]> {
+  return db.query.user.findMany({
+    where: (users, { isNull }) => isNull(users.deletedAt),
+    orderBy: (users) => desc(users.createdAt),
+    limit,
+    offset,
+  });
 }
 
-export async function listChatsPageByUser(
+export async function createUser(data: UserInsert): Promise<User> {
+  const newUser = {
+    ...data,
+    id: data.id || randomUUID(),
+  };
+  const result = await db.insert(user).values(newUser).returning();
+  return result[0]!;
+}
+
+export async function updateUser(
   userId: string,
-  cursor?: string | null,
-): Promise<ChatListPage> {
-  const cursorValue = cursor?.trim();
-  const parsedCursor = cursorValue ? decodeChatCursor(cursorValue) : null;
-  const rows = await db
-    .select({
-      id: chat.id,
-      title: chat.title,
-      updatedAt: chat.updatedAt,
-    })
-    .from(chat)
-    .where(
-      and(
-        eq(chat.userId, userId),
-        parsedCursor
-          ? or(
-              lt(chat.updatedAt, parsedCursor.updatedAt),
-              and(eq(chat.updatedAt, parsedCursor.updatedAt), lt(chat.id, parsedCursor.id)),
-            )
-          : undefined,
-      ),
-    )
-    .orderBy(desc(chat.updatedAt), desc(chat.id))
-    .limit(CHAT_HISTORY_PAGE_SIZE + 1);
-
-  const hasMore = rows.length > CHAT_HISTORY_PAGE_SIZE;
-  const pageRows = hasMore ? rows.slice(0, CHAT_HISTORY_PAGE_SIZE) : rows;
-  const last = pageRows[pageRows.length - 1];
-
-  return {
-    items: pageRows.map((row) => ({
-      id: row.id,
-      title: row.title,
-      updatedAt: row.updatedAt.toISOString(),
-    })),
-    nextCursor: hasMore && last ? encodeChatCursor(last.updatedAt, last.id) : null,
-  };
+  data: Partial<Omit<UserInsert, "id">>,
+): Promise<User | undefined> {
+  const result = await db
+    .update(user)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(user.id, userId))
+    .returning();
+  return result[0];
 }
 
-export async function createChat(
+export async function deleteUser(userId: string): Promise<void> {
+  await db
+    .update(user)
+    .set({ deletedAt: new Date() })
+    .where(eq(user.id, userId));
+}
+
+export async function banUser(userId: string, reason: string): Promise<User | undefined> {
+  const result = await db
+    .update(user)
+    .set({ status: "banned", updatedAt: new Date() })
+    .where(eq(user.id, userId))
+    .returning();
+
+  if (result[0]) {
+    await logActivity(userId, "user.banned", "User account banned", { reason });
+  }
+
+  return result[0];
+}
+
+// ============================================================================
+// Media File Queries
+// ============================================================================
+
+export async function createMediaFile(data: MediaFileInsert): Promise<MediaFile> {
+  const newMedia = {
+    ...data,
+    id: data.id || randomUUID(),
+  };
+  const result = await db.insert(mediaFile).values(newMedia).returning();
+  return result[0]!;
+}
+
+export async function getMediaById(mediaId: string): Promise<MediaFile | undefined> {
+  return db.query.mediaFile.findFirst({
+    where: (media, { eq }) => eq(media.id, mediaId),
+  });
+}
+
+export async function listMediaByChat(chatId: string): Promise<MediaFile[]> {
+  return db.query.mediaFile.findMany({
+    where: (media, { eq, isNull }) =>
+      and(eq(media.chatId, chatId), isNull(media.deletedAt)),
+    orderBy: (media) => desc(media.createdAt),
+  });
+}
+
+export async function listMediaByUser(userId: string): Promise<MediaFile[]> {
+  return db.query.mediaFile.findMany({
+    where: (media, { eq, isNull }) =>
+      and(eq(media.userId, userId), isNull(media.deletedAt)),
+    orderBy: (media) => desc(media.createdAt),
+  });
+}
+
+export async function deleteMediaFile(mediaId: string): Promise<void> {
+  await db
+    .update(mediaFile)
+    .set({ deletedAt: new Date() })
+    .where(eq(mediaFile.id, mediaId));
+}
+
+// ============================================================================
+// Activity Log Queries
+// ============================================================================
+
+export async function logActivity(
   userId: string,
-  {
-    pendingUserMessage,
-  }: {
-    readonly pendingUserMessage?: string;
-  } = {},
-) {
-  const pendingMessage = pendingUserMessage?.trim();
-  const pendingMessageCreatedAt = pendingMessage ? new Date() : null;
-  const [row] = await db
-    .insert(chat)
-    .values({
-      id: randomUUID(),
-      pendingUserMessage: pendingMessage || null,
-      pendingUserMessageCreatedAt: pendingMessageCreatedAt,
-      title: pendingMessage ? createFallbackTitle(pendingMessage) : DEFAULT_CHAT_TITLE,
-      userId,
-    })
-    .returning({
-      id: chat.id,
-      title: chat.title,
-      updatedAt: chat.updatedAt,
-    });
-
-  if (!row) {
-    throw new Error("Failed to create chat.");
-  }
-
-  return {
-    id: row.id,
-    title: row.title,
-    updatedAt: row.updatedAt.toISOString(),
+  eventType: string,
+  eventName: string,
+  details?: Record<string, unknown>,
+  options?: { ipAddress?: string; userAgent?: string },
+): Promise<ActivityLog> {
+  const log = {
+    id: randomUUID(),
+    userId,
+    eventType,
+    eventName,
+    details: details || {},
+    ipAddress: options?.ipAddress,
+    userAgent: options?.userAgent,
+    status: "success" as const,
   };
+  const result = await db.insert(activityLog).values(log).returning();
+  return result[0]!;
 }
 
-export async function getChatForUser(chatId: string, userId: string): Promise<ActiveChat | null> {
-  const [row] = await db
-    .select({
-      id: chat.id,
-      title: chat.title,
-      eveSession: chat.eveSession,
-      pendingUserMessage: chat.pendingUserMessage,
-      pendingUserMessageCreatedAt: chat.pendingUserMessageCreatedAt,
-    })
-    .from(chat)
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)))
-    .limit(1);
+export async function getActivityLogs(
+  filters?: {
+    userId?: string;
+    eventType?: string;
+    startDate?: Date;
+    endDate?: Date;
+    limit?: number;
+    offset?: number;
+  },
+): Promise<ActivityLog[]> {
+  const { userId, eventType, startDate, endDate, limit = 100, offset = 0 } = filters || {};
 
-  if (!row) {
-    return null;
-  }
+  const conditions = [];
+  if (userId) conditions.push(eq(activityLog.userId, userId));
+  if (eventType) conditions.push(eq(activityLog.eventType, eventType));
+  if (startDate) conditions.push(gte(activityLog.createdAt, startDate));
+  if (endDate) conditions.push(lte(activityLog.createdAt, endDate));
 
-  const events = await db
-    .select({
-      createdAt: chatEvent.createdAt,
-      event: chatEvent.event,
-    })
-    .from(chatEvent)
-    .where(eq(chatEvent.chatId, chatId))
-    .orderBy(asc(chatEvent.eventIndex));
+  return db.query.activityLog.findMany({
+    where: conditions.length > 0 ? and(...conditions) : undefined,
+    orderBy: (logs) => desc(logs.createdAt),
+    limit,
+    offset,
+  });
+}
 
-  const eventValues = events.map((eventRow) => eventRow.event);
-  const pendingMessageCreatedAt = row.pendingUserMessageCreatedAt;
-  const hasCurrentTurnCompleted = Boolean(
-    pendingMessageCreatedAt &&
-    events.some(
-      (eventRow) =>
-        eventRow.createdAt >= pendingMessageCreatedAt &&
-        isChatTurnSettledEvent(eventRow.event),
-    ),
-  );
+export async function getUserActivityLogs(
+  userId: string,
+  limit = 50,
+  offset = 0,
+): Promise<ActivityLog[]> {
+  return db.query.activityLog.findMany({
+    where: (logs, { eq }) => eq(logs.userId, userId),
+    orderBy: (logs) => desc(logs.createdAt),
+    limit,
+    offset,
+  });
+}
 
-  return {
-    events: eventValues,
-    id: row.id,
-    pendingUserMessage: hasCurrentTurnCompleted ? null : row.pendingUserMessage,
-    session: row.eveSession ?? undefined,
-    title: row.title,
+// ============================================================================
+// Audit Log Queries
+// ============================================================================
+
+export async function logAudit(data: AuditLogInsert): Promise<AuditLog> {
+  const log = {
+    ...data,
+    id: data.id || randomUUID(),
   };
+  const result = await db.insert(auditLog).values(log).returning();
+  return result[0]!;
 }
 
-export async function markChatPendingMessage({
-  chatId,
-  message,
-  userId,
-}: {
-  readonly chatId: string;
-  readonly message: string;
-  readonly userId: string;
-}) {
-  const pendingMessage = message.trim();
+export async function getAuditLogs(
+  filters?: {
+    adminId?: string;
+    targetId?: string;
+    action?: string;
+    startDate?: Date;
+    endDate?: Date;
+    limit?: number;
+    offset?: number;
+  },
+): Promise<AuditLog[]> {
+  const { adminId, targetId, action, startDate, endDate, limit = 100, offset = 0 } =
+    filters || {};
 
-  if (!pendingMessage) {
-    throw new Error("Message cannot be empty.");
-  }
+  const conditions = [];
+  if (adminId) conditions.push(eq(auditLog.adminId, adminId));
+  if (targetId) conditions.push(eq(auditLog.targetId, targetId));
+  if (action) conditions.push(eq(auditLog.action, action));
+  if (startDate) conditions.push(gte(auditLog.createdAt, startDate));
+  if (endDate) conditions.push(lte(auditLog.createdAt, endDate));
 
-  const [row] = await db
-    .update(chat)
-    .set({
-      pendingUserMessage: pendingMessage,
-      pendingUserMessageCreatedAt: new Date(),
-      title: sql<string>`
-        case
-          when ${chat.title} = ${DEFAULT_CHAT_TITLE}
-          then ${createFallbackTitle(pendingMessage)}
-          else ${chat.title}
-        end
-      `,
-      updatedAt: new Date(),
-    })
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)))
-    .returning({
-      id: chat.id,
-      title: chat.title,
-      updatedAt: chat.updatedAt,
-    });
-
-  if (!row) {
-    throw new Error("Chat not found.");
-  }
-
-  return {
-    id: row.id,
-    title: row.title,
-    updatedAt: row.updatedAt.toISOString(),
-  };
-}
-
-export async function clearChatPendingMessage({
-  chatId,
-  userId,
-}: {
-  readonly chatId: string;
-  readonly userId: string;
-}) {
-  await db
-    .update(chat)
-    .set({
-      pendingUserMessage: null,
-      pendingUserMessageCreatedAt: null,
-    })
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)));
-}
-
-export async function skipChatAuthorization({
-  chatId,
-  events,
-  session,
-  userId,
-}: {
-  readonly chatId: string;
-  readonly events: readonly MessageStreamEvent[];
-  readonly session: ClientSessionState | undefined;
-  readonly userId: string;
-}) {
-  if (events.length === 0) {
-    throw new Error("No authorization events to save.");
-  }
-
-  const [ownedChat] = await db
-    .select({ id: chat.id })
-    .from(chat)
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)))
-    .limit(1);
-
-  if (!ownedChat) {
-    throw new Error("Chat not found.");
-  }
-
-  const [lastEvent] = await db
-    .select({ eventIndex: chatEvent.eventIndex })
-    .from(chatEvent)
-    .where(eq(chatEvent.chatId, chatId))
-    .orderBy(desc(chatEvent.eventIndex))
-    .limit(1);
-  const eventIndex = (lastEvent?.eventIndex ?? -1) + 1;
-
-  await db
-    .insert(chatEvent)
-    .values(
-      events.map((event, offset) => ({
-        chatId,
-        event,
-        eventIndex: eventIndex + offset,
-        id: randomUUID(),
-      })),
-    )
-    .onConflictDoUpdate({
-      set: { event: sql`excluded.event` },
-      target: [chatEvent.chatId, chatEvent.eventIndex],
-    });
-
-  const [row] = await db
-    .update(chat)
-    .set({
-      eveSession: session ?? null,
-      pendingUserMessage: null,
-      pendingUserMessageCreatedAt: null,
-      updatedAt: new Date(),
-    })
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)))
-    .returning({
-      id: chat.id,
-      title: chat.title,
-      updatedAt: chat.updatedAt,
-    });
-
-  if (!row) {
-    throw new Error("Chat not found.");
-  }
-
-  return {
-    chat: {
-      id: row.id,
-      title: row.title,
-      updatedAt: row.updatedAt.toISOString(),
-    },
-    eventCount: events.length,
-    eventIndex,
-  };
-}
-
-export async function saveChatSessionState({
-  chatId,
-  session,
-  userId,
-}: {
-  readonly chatId: string;
-  readonly session: ClientSessionState;
-  readonly userId: string;
-}) {
-  await db
-    .update(chat)
-    .set({
-      eveSession: session,
-    })
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)));
-}
-
-export async function appendChatEvent({
-  chatId,
-  event,
-  eventIndex,
-  userId,
-}: {
-  readonly chatId: string;
-  readonly event: MessageStreamEvent;
-  readonly eventIndex: number;
-  readonly userId: string;
-}) {
-  const [ownedChat] = await db
-    .select({ id: chat.id })
-    .from(chat)
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)))
-    .limit(1);
-
-  if (!ownedChat) {
-    throw new Error("Chat not found.");
-  }
-
-  await db
-    .insert(chatEvent)
-    .values({
-      chatId,
-      event,
-      eventIndex,
-      id: randomUUID(),
-    })
-    .onConflictDoUpdate({
-      set: { event },
-      target: [chatEvent.chatId, chatEvent.eventIndex],
-    });
-}
-
-export async function saveChatSnapshot({
-  chatId,
-  events,
-  session,
-  userId,
-}: {
-  readonly chatId: string;
-  readonly events: readonly MessageStreamEvent[];
-  readonly session: ClientSessionState | undefined;
-  readonly userId: string;
-}) {
-  const [ownedChat] = await db
-    .select({ id: chat.id })
-    .from(chat)
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)))
-    .limit(1);
-
-  if (!ownedChat) {
-    throw new Error("Chat not found.");
-  }
-
-  if (events.length > 0) {
-    await db
-      .insert(chatEvent)
-      .values(
-        events.map((event, eventIndex) => ({
-          chatId,
-          event,
-          eventIndex,
-          id: randomUUID(),
-        })),
-      )
-      .onConflictDoUpdate({
-        set: { event: sql`excluded.event` },
-        target: [chatEvent.chatId, chatEvent.eventIndex],
-      });
-  }
-
-  await db
-    .delete(chatEvent)
-    .where(and(eq(chatEvent.chatId, chatId), gte(chatEvent.eventIndex, events.length)));
-
-  await db
-    .update(chat)
-    .set({
-      eveSession: session ?? null,
-      pendingUserMessage: null,
-      pendingUserMessageCreatedAt: null,
-      updatedAt: new Date(),
-    })
-    .where(and(eq(chat.id, chatId), eq(chat.userId, userId)));
-}
-
-export async function deleteChatForUser(chatId: string, userId: string) {
-  await db.delete(chat).where(and(eq(chat.id, chatId), eq(chat.userId, userId)));
+  return db.query.auditLog.findMany({
+    where: conditions.length > 0 ? and(...conditions) : undefined,
+    orderBy: (logs) => desc(logs.createdAt),
+    limit,
+    offset,
+  });
 }
